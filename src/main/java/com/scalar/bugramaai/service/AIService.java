@@ -1,67 +1,85 @@
 package com.scalar.bugramaai.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.*;
 import org.springframework.stereotype.Service;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.web.client.RestTemplate;
 
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
+import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.HashMap;
+import java.util.Map;
 
 @Service
 public class AIService {
     private static final Logger logger = LoggerFactory.getLogger(AIService.class);
     private static final ObjectMapper objectMapper = new ObjectMapper();
+    private final RestTemplate restTemplate = new RestTemplate();
 
     private Process ollamaServeProcess;
     private Process mistralProcess;
+    private Process flaskProcess;
 
     @PostConstruct
-    public void startOllamaAndMistral() {
+    public void startAIComponents() {
         try {
-        // Check if Ollama is already running
-        Process checkProcess = new ProcessBuilder("pgrep", "-f", "ollama").start();
-        if (checkProcess.waitFor() == 0) {
-            logger.info("Ollama is already running. Skipping startup.");
-            return; // Skip starting a new instance
-        }
+            logger.info("🔄 Checking if Ollama is running...");
+            if (!isProcessRunning("ollama serve")) {
+                logger.info("🚀 Starting Ollama...");
+                ollamaServeProcess = startProcess("ollama serve");
+            }
 
-            logger.info("Starting Ollama server...");
-            ollamaServeProcess = new ProcessBuilder("ollama", "serve").start();
-            Thread.sleep(5000); // Wait for the server to initialize
+            logger.info("🔍 Checking if Mistral model is running...");
+            if (!isProcessRunning("ollama run mistral")) {
+                logger.info("🚀 Starting Mistral AI model...");
+                mistralProcess = startProcess("ollama run mistral");
+            }
 
-            logger.info("Starting Mistral AI model...");
-            mistralProcess = new ProcessBuilder("ollama", "run", "mistral").start();
+            logger.info("🔍 Checking if Flask FAISS server is running...");
+            if (!isProcessRunning("flask run")) {
+                logger.info("🚀 Starting Flask FAISS server...");
+                flaskProcess = startProcess("source mistral_env/bin/activate && flask run --host=0.0.0.0 --port=5000");
+            }
 
-            logger.info("Ollama and Mistral started successfully!");
-        } catch (IOException | InterruptedException e) {
-            logger.error("Failed to start Ollama/Mistral", e);
+            logger.info("✅ Ollama, Mistral, and Flask FAISS started successfully!");
+        } catch (Exception e) {
+            logger.error("❌ Error starting AI components", e);
         }
     }
 
     @PreDestroy
-    public void stopOllamaAndMistral() {
-        try {
-            if (mistralProcess != null) {
-                logger.info("Stopping Mistral...");
-                mistralProcess.destroy();
-                logger.info("Mistral stopped.");
-            }
+    public void stopAIComponents() {
+        logger.info("🛑 Stopping AI components...");
+        stopProcess(ollamaServeProcess, "Ollama");
+        stopProcess(mistralProcess, "Mistral");
+        stopProcess(flaskProcess, "Flask FAISS");
+        logger.info("✅ AI components stopped.");
+    }
 
-            if (ollamaServeProcess != null) {
-                logger.info("Stopping Ollama server...");
-                ollamaServeProcess.destroy();
-                logger.info("Ollama server stopped.");
-            }
-        } catch (Exception e) {
-            logger.error("Error while stopping Ollama/Mistral", e);
+    private Process startProcess(String command) throws IOException {
+        return new ProcessBuilder("bash", "-c", command).start();
+    }
+
+    private void stopProcess(Process process, String name) {
+        if (process != null) {
+            process.destroy();
+            logger.info("🛑 {} stopped.", name);
+        }
+    }
+
+    private boolean isProcessRunning(String processName) {
+        try {
+            Process process = new ProcessBuilder("bash", "-c", "pgrep -f \"" + processName + "\"").start();
+            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+            return reader.readLine() != null;  // If there's output, process is running
+        } catch (IOException e) {
+            return false;
         }
     }
 
@@ -94,9 +112,39 @@ public class AIService {
         }
     }
 
+    public String searchBugInFaiss(String bugDescription) {
+        try {
+            String url = "http://localhost:8383/search";  // FAISS Python API
+
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+
+            Map<String, String> requestBody = new HashMap<>();
+            requestBody.put("query", bugDescription);
+
+            HttpEntity<Map<String, String>> entity = new HttpEntity<>(requestBody, headers);
+
+            ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.POST, entity, String.class);
+
+            return response.getBody();
+        } catch (Exception e) {
+            logger.error("❌ Error searching in FAISS: {}", e.getMessage());
+            return "FAISS search failed";
+        }
+    }
 
     public String getAIResolution(String bugDescription) {
         try {
+            // 🔍 Step 1: Search in FAISS first
+            String faissResponse = searchBugInFaiss(bugDescription);
+            logger.info("🔍 FAISS Search Response: {}", faissResponse);
+
+            // 🔍 Step 2: If FAISS returns a relevant bug, return it
+            if (!faissResponse.contains("FAISS search failed")) {
+                return "🔍 FAISS Suggested Related Issues: \n" + faissResponse;
+            }
+
+            // 🔍 Step 3: If FAISS fails, proceed with Mistral AI
             URL url = new URL("http://localhost:11434/api/generate");
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
@@ -106,12 +154,7 @@ public class AIService {
             // Extract Market from Description
             String market = extractMarket(bugDescription);
 
-//            String inputJson = "{\"model\":\"mistral\",\"prompt\":\"Bug in " + market +
-//                    ": " + bugDescription +
-//                    ". How to investigate? Key checks: " + getStandardInvestigationSteps(market) + "\"}";
-
-
-            String inputJson = "{\"model\":\"mistral\",\"prompt\":\"Bug: " + bugDescription + " can you answer it in five words?\"}";
+            String inputJson = "{\"model\":\"mistral\",\"prompt\":\"Bug: " + bugDescription + " How to investigate? Key checks: " + getStandardInvestigationSteps(market) + "\"}";
             try (OutputStream os = conn.getOutputStream()) {
                 os.write(inputJson.getBytes());
             }
@@ -136,6 +179,7 @@ public class AIService {
             br.close();
             return response.toString();
         } catch (Exception e) {
+            logger.error("❌ Error in AI resolution: {}", e.getMessage());
             return "AI resolution not available";
         }
     }
